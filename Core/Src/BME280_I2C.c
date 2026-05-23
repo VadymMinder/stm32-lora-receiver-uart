@@ -5,7 +5,7 @@ extern I2C_HandleTypeDef hi2c1;
 #define BME280_I2C &hi2c1
 
 
-#define BME280_ADDRESS 0xEC  // SDIO is grounded, the 7 bit address is 0x76 and 8 bit address = 0x76<<1 = 0xEC
+#define BME280_ADDRESS 0xEC  // SDIO is grounded, t he 7 bit address is 0x76 and8 bit address = 0x76<<1 = 0xEC
 
 extern float Temperature, Pressure, Humidity;
 

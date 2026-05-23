@@ -18,12 +18,22 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "SX1278.h"
 #include "BME280_I2C.h"
+#include "esp01s_driver.h"
+#include "debug.h"
+#include "st7735.h"
+#include "fonts.h"
+#include "image.h"
+
+#include "sd_logger.h"
+#include "structs.h"
 
 /* USER CODE END Includes */
 
@@ -43,21 +53,36 @@
 
 #define RESET_GPIO_Port GPIOB
 #define RESET_Pin GPIO_PIN_0
+
+#define MAX_NODES 4
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define DBG_UART &huart1
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+IWDG_HandleTypeDef hiwdg;
+
 SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
+
+uint32_t last_button_press = 0;
+
+NodeData node_cache[MAX_NODES];
+uint8_t node_valid[MAX_NODES] = {0};
+volatile uint8_t selected_node = 0;
+volatile uint8_t node_switch_flag = 0;
+
+uint32_t last_log_time = 0;
+const uint32_t LOG_INTERVAL = 5000;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,10 +91,30 @@ static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_USART6_UART_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 void Led_Blink_Count(uint8_t n, uint8_t delay);
 uint8_t crc8(uint8_t *data, uint8_t len);
-void read_lora_packet(uint8_t *buf, char *output);
+NodeData read_lora_packet(uint8_t *buf);
+void draw_intro(){
+	ST7735_FillScreen(ST7735_BLACK);
+	ST7735_DrawString(28,90,"Vadym Minder", Font_5x7, ST7735_WHITE, ST7735_BLACK);
+	ST7735_DrawString(49,98,"KV-22", Font_5x7, ST7735_WHITE, ST7735_BLACK);
+	ST7735_DrawImage(40, 8, 48, 67, icon);
+}
+
+void draw_interface(){
+	ST7735_DrawRect(0, 16, 128, 112, ST7735_WHITE);
+	ST7735_DrawFastHLine(0, 80, 128, ST7735_WHITE);
+	//ST7735_DrawFastHLine(0, 104, 128, ST7735_WHITE);
+	ST7735_DrawFastVLine(64, 80, 48, ST7735_WHITE);
+	ST7735_DrawString(98, 46, "^C", Font_11x18, ST7735_WHITE, ST7735_BLACK);
+	ST7735_DrawString(9, 110, "HUMIDITY", Font_5x7, ST7735_WHITE, ST7735_BLACK);
+	ST7735_DrawString(88, 110, "hPa", Font_5x7, ST7735_WHITE, ST7735_BLACK);
+}
+
+void draw_measurements(const NodeData *d);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -117,7 +162,27 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
+  MX_USART6_UART_Init();
+  MX_IWDG_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
+
+  HAL_Delay(500);
+  debug_log("STM32_CORE","MODULES INIT START");
+
+  char dbg[32];
+  snprintf(dbg, sizeof(dbg), "USERPath: '%s' ret:%d\r\n", USERPath, retUSER);
+  HAL_UART_Transmit(&huart1, (uint8_t*)dbg, strlen(dbg), 100);
+  if (SD_Logger_Init() != SD_LOG_OK) {
+          debug_log("STM32_CORE", "SD INIT FAIL");
+      }
+  ST7735_Init();
+  ST7735_Backlight_On();
+  ST7735_SetRotation(1);
+  draw_intro();
+
+
+
   SX1278_hw.dio0.port  = DIO0_GPIO_Port;
   SX1278_hw.dio0.pin   = DIO0_Pin;
 
@@ -137,35 +202,84 @@ int main(void)
 
   BME280_Config(OSRS_2, OSRS_16, OSRS_1, MODE_NORMAL, T_SB_0p5, IIR_16);
 
-  uint8_t lora_packet[7];
 
+  uint8_t lora_packet[9];
+  NodeData hub = {0, Temperature, Humidity, Pressure};
+  node_cache[0] = hub;
+  node_valid[0] = 1;
+  debug_log("STM32_CORE","MODULES INIT END");
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+  uint8_t intro_complete = 0;
   while (1)
   {
+	HAL_IWDG_Refresh(&hiwdg);
 
-	BME280_Measure();
+	if (HAL_GetTick() - last_log_time >= LOG_INTERVAL) {
+		last_log_time = HAL_GetTick();
+
+		debug_log("STM32_CORE","BME280 Measure START");
+		BME280_Measure();
+		NodeData hub = {0, Temperature, Humidity, Pressure/100.0f};
+		node_cache[0] = hub;
+		node_valid[0] = 1;
+		debug_log("STM32_CORE","BME280 Measure END");
+		debug_log("STM32_CORE","SD_Log START");
+		SD_Logger_Write(&hub);
+		SD_Logger_Flush();
+		debug_log("STM32_CORE","SD_Log END");
+
+
+		debug_log("STM32_CORE","ESP SEND START");
+		ESP_SendMessage_Node(&hub);
+		debug_log("STM32_CORE","ESP SEND END");
+	}
 
 	if (lora_rx_flag) {
-    lora_rx_flag = 0;
+		lora_rx_flag = 0;
 
-    uint8_t len = SX1278_available(&SX1278);
-    if (len > 0) {
-        SX1278_read(&SX1278, (uint8_t*)lora_packet, len);
+		uint8_t len = SX1278_available(&SX1278);
+		if (len > 0) {
+			SX1278_read(&SX1278, (uint8_t*)lora_packet, len);
+			NodeData node = read_lora_packet(lora_packet);
+				if (node.id > 0 && node.id < MAX_NODES) {
+					node_cache[node.id] = node;
+					node_valid[node.id] = 1;
+					SD_Logger_Write(&node);
+					ESP_SendMessage_Node(&node);
+					debug_log("STM32_CORE","ESP SEND lora END");
+				}
+		}
 
-        read_lora_packet(lora_packet, buffer);
-        HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), 100);
+		SX1278_LoRaEntryRx(&SX1278, 16, 3000);
+	}
 
-        sprintf(buffer_BME, "BME280: T: %d.%02d H: %d.%02d\n", (int)Temperature, (int)((Temperature - (int)Temperature) * 100), (int)Humidity, (int)((Humidity - (int)Humidity) * 100));
-        HAL_UART_Transmit(&huart1, (uint8_t*)buffer_BME, strlen(buffer_BME), 100);
-    }
 
-    SX1278_LoRaEntryRx(&SX1278, 16, 3000);
-}
 
+	if (intro_complete == 0) {
+		ST7735_FillScreen(ST7735_BLACK);
+		draw_interface();
+		intro_complete = 1;
+	}
+
+	// кешуємо дані від ноди
+	if (node_switch_flag) {
+	    node_switch_flag = 0;
+	    if (node_valid[selected_node]) {
+	        draw_measurements(&node_cache[selected_node]);
+	    }
+	}
+
+	// малюємо або при нових даних обраної ноди, або при перемиканні
+	if (node_valid[selected_node] && node_cache[selected_node].id == 0) {
+	    if (HAL_GetTick() - last_log_time < 100) { // щойно оновились дані HUB
+	        draw_measurements(&node_cache[selected_node]);
+	    }
+	}
 
     /* USER CODE END WHILE */
 
@@ -191,9 +305,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 8;
@@ -251,6 +366,34 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+  hiwdg.Init.Reload = 4095;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
 
 }
 
@@ -326,6 +469,39 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * @brief USART6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART6_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART6_Init 0 */
+
+  /* USER CODE END USART6_Init 0 */
+
+  /* USER CODE BEGIN USART6_Init 1 */
+
+  /* USER CODE END USART6_Init 1 */
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART6_Init 2 */
+
+  /* USER CODE END USART6_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -345,10 +521,13 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_15, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2|GPIO_PIN_14, GPIO_PIN_SET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -357,6 +536,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PA3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PA4 */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -364,8 +549,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB0 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  /*Configure GPIO pins : PB0 PB2 PB12 PB13
+                           PB14 PB15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_2|GPIO_PIN_12|GPIO_PIN_13
+                          |GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -381,6 +568,9 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
 }
@@ -394,6 +584,23 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == DIO0_Pin) {
         lora_rx_flag = 1;
 
+    }
+
+    if (GPIO_Pin == GPIO_PIN_3) {
+		// Програмний антидребезг: ігноруємо натискання частіше ніж раз на 250 мс
+		if ((HAL_GetTick() - last_button_press) > 250) {
+			last_button_press = HAL_GetTick();
+    	debug_log("STM32_CORE", "BTN CLICK");
+            // шукаємо наступну валідну ноду по колу
+            for (uint8_t i = 1; i <= MAX_NODES; i++) {
+                uint8_t next = (selected_node + i) % MAX_NODES;
+                if (node_valid[next]) {
+                    selected_node = next;
+                    node_switch_flag = 1;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -421,32 +628,111 @@ uint8_t crc8(uint8_t *data, uint8_t len) {
     return crc;
 }
 
-void read_lora_packet(uint8_t *buf, char *output){
-	int16_t temp = 0;
-	uint16_t hum = 0;
-	uint8_t id;
+NodeData read_lora_packet(uint8_t *buf)
+{
+	NodeData d = {0};
 
-	if(crc8(buf, 6) != buf[6]){
-		Led_Blink_Count(1, 10);
+    // CRC CHECK
+    if (crc8(buf, 8) != buf[8])
+    {
+    	debug_log("STM32_CORE", "CRC ERROR");
+    	return d;
+    }
+
+    // PARSE PACKET
+
+    // 0 byte - ID
+    d.id = buf[0];
+
+    // 1-2 byte - temperature
+    int16_t temp = (int16_t)((buf[1] << 8) | buf[2]);
+    d.temp = temp / 100.0f;
+
+    // 3-4 byte - humidity
+    uint16_t hum = (uint16_t)((buf[3] << 8) | buf[4]);
+    d.humidity = hum / 100.0f;
+
+    // 5-6 byte - Pressure
+    uint16_t press = (uint16_t)((buf[5] << 8) | buf[6]);
+    d.pressure = press;
+
+	// 7 byte - Flags
+	uint8_t flags = buf[7];
+
+
+    debug_log("STM32_CORE", "LoRa read success");
+    return d;
+}
+
+void draw_measurements(const NodeData *d){
+
+	char str[12];
+
+	static int prevId = -999;
+
+	char nodeName[12];
+
+	if(d->id != prevId){
+		prevId = d->id;
+
+		if(d->id == 0){
+			snprintf(nodeName, sizeof(nodeName), "%-10s", "HUB");
+		}else if(d->id > 0){
+			snprintf(nodeName, sizeof(nodeName), "NODE %-5d", d->id);
+		}else{
+			snprintf(nodeName, sizeof(nodeName), "%-10s", "UNKNOWN");
+		}
+
+		ST7735_DrawString(4, 20, nodeName,
+		                  Font_11x18,
+		                  ST7735_WHITE,
+		                  ST7735_BLACK);
 	}
 
-	//0-1 byte temperature
-	temp = (int16_t)((buf[0] << 8) | buf[1]);
+	int16_t temp10 = (int16_t)(d->temp * 10 + 0.5f);
+	static int prevTemp10 = -999;
 
-	//2-3 byte humidity
-	hum = (uint16_t)((buf[2] << 8) | buf[3]);
+	if(temp10 != prevTemp10){
+		prevTemp10 = temp10;
 
-	//4 byte MC ID
-	id = buf[4];
+		char sign = '+';
+		int16_t value = temp10;
 
-	//5 byte flags
-	//...
+		if (temp10 < 0)
+		{
+		    sign = '-';
+		    value = -temp10;
+		}
 
-	sprintf(output, "%d: T: %d.%02d H: %d.%02d\n", id, temp / 100, temp % 100, hum / 100, hum % 100);
+		sprintf(str, "%c%d.%d", sign, value / 10, value % 10);
+		ST7735_DrawString(14, 46, str, Font_16x26, ST7735_WHITE, ST7735_BLACK);
+	}
 
+	uint8_t humInt = (uint8_t)(d->humidity + 0.5f);
+	static int16_t prevHumInt = -999;
+
+	if(humInt != prevHumInt){
+		prevHumInt = humInt;
+
+		sprintf(str, "%-3u%%", humInt);
+		ST7735_DrawString(9, 90, str, Font_11x18, ST7735_WHITE, ST7735_BLACK);
+	}
+
+
+	uint16_t pressureHpa = (uint16_t)(d->pressure + 0.5f);
+	static uint16_t prevPressureHpa = 0;
+
+	if(pressureHpa != prevPressureHpa){
+		prevPressureHpa = pressureHpa;
+
+		sprintf(str, "%u", pressureHpa);
+		ST7735_DrawString(80, 90, str, Font_11x18, ST7735_WHITE, ST7735_BLACK);
+	}
 
 
 }
+
+
 /* USER CODE END 4 */
 
 /**
