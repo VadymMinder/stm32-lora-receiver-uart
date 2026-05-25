@@ -21,6 +21,8 @@ uint8_t ESP_ConnectTCP(void);
 // Send data over TCP
 void ESP_SendMessage(char *msg);
 void ESP_SendMessage_Node(const NodeData *d);
+uint8_t ESP_SendMessage_Node_DMA(const NodeData *d);
+void ESP_Process(void);
 
 // Low-level ESP AT interface
 void ESP_Send(char *cmd);

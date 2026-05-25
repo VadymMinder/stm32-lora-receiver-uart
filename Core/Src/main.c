@@ -44,6 +44,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define LOG_INTERVAL 10000
 #define CYCLE_PERIOD_MS 60000    // Базовий хвилинний інтервал опитування
 #define SLOT_OFFSET_MS  2000     // Зсув слоту (по 2 секунди для кожного вузла)
 
@@ -75,6 +76,7 @@ SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart6;
+DMA_HandleTypeDef hdma_usart6_tx;
 
 /* USER CODE BEGIN PV */
 
@@ -87,14 +89,14 @@ volatile uint8_t selected_node = 0;
 volatile uint8_t node_switch_flag = 0;
 int32_t node_clock_offset[MAX_NODES] = {0};
 
-
+volatile uint32_t lora_rx_timestamp = 0;
 uint32_t last_log_time = 0;
-const uint32_t LOG_INTERVAL = 5000;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
@@ -167,6 +169,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
@@ -227,57 +230,56 @@ int main(void)
     while (1)
     {
       HAL_IWDG_Refresh(&hiwdg); //[cite: 1]
+      ESP_Process();
 
       // 1. Блок збору та логування даних
-      if (HAL_GetTick() - last_log_time >= LOG_INTERVAL) { //[cite: 1]
-          last_log_time = HAL_GetTick(); //[cite: 1]
+      if ((HAL_GetTick() - last_log_time >= LOG_INTERVAL) || !intro_complete) {
+          last_log_time = HAL_GetTick();
 
           RTC_TimeTypeDef sTime = {0};
           RTC_DateTypeDef sDate = {0};
           HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
           HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 
-          //debug_log("STM32_CORE","BME280 Measure START"); //[cite: 1]
-          BME280_Measure(); //[cite: 1]
-          NodeData hub = {0, Temperature, Humidity, Pressure/100.0f}; //[cite: 1]
+          //debug_log("STM32_CORE","BME280 Measure START");
+          BME280_Measure();
+          NodeData hub = {0, Temperature, Humidity, Pressure/100.0f};
 
-          node_cache[0] = hub; //[cite: 1]
-          node_valid[0] = 1;     // Для екрану (ніколи не скидаємо)[cite: 1]
+          node_cache[0] = hub;
+          node_valid[0] = 1;     // Для екрану (ніколи не скидаємо)
           node_unsaved[0] = 1;   // Для SD/ESP (скинемо після запису)
 
-          debug_log("STM32_CORE","BME280 Measure END"); //[cite: 1]
-
-          // Пакетне збереження накопичених даних
-          for (uint8_t i = 0; i < MAX_NODES; i++) { //[cite: 1]
-              if (node_unsaved[i]) { // Змінили перевірку на новий масив
-                  if (i == 0) {
-                      //debug_log("STM32_CORE","SD_Log START"); //[cite: 1]
-                      SD_Logger_Write(&node_cache[i]); //[cite: 1]
-                      //debug_log("STM32_CORE","SD_Log END"); //[cite: 1]
-
-                      //debug_log("STM32_CORE","ESP SEND START"); //[cite: 1]
-                      ESP_SendMessage_Node(&node_cache[i]); //[cite: 1]
-                      debug_log("STM32_CORE","ESP SEND END"); //[cite: 1]
-                  } else {
-                      SD_Logger_Write(&node_cache[i]); //[cite: 1]
-                      ESP_SendMessage_Node(&node_cache[i]); //[cite: 1]
-                      debug_log("STM32_CORE","ESP SEND lora END"); //[cite: 1]
-                  }
-                  node_unsaved[i] = 0; // Скидаємо ТІЛЬКИ прапорець збереження!
-              }
-          }
-          SD_Logger_Flush(); //[cite: 1]
+          debug_log("STM32_CORE","BME280 Measure END");
+          if (!intro_complete) {
+			ST7735_FillScreen(ST7735_BLACK);
+			draw_interface();
+			draw_measurements(&node_cache[selected_node]);
+			intro_complete = 1;
+		}else if (selected_node == 0) {
+            draw_measurements(&node_cache[0]);
+        }
       }
 
-      // 2. Блок обробки вхідних радіопакетів
-      if (lora_rx_flag) { //[cite: 1]
-    	  debug_log("STM32 CORE", "LoRa RX START");
-          lora_rx_flag = 0; //[cite: 1]
+      for (uint8_t i = 0; i < MAX_NODES; i++) {
+			if (node_unsaved[i]) {
+				if (ESP_SendMessage_Node_DMA(&node_cache[i])) {
+					SD_Logger_Write(&node_cache[i]);
+					SD_Logger_Flush();
+					node_unsaved[i] = 0;
+				}
+				break;
+			}
+		}
 
-          uint8_t len = SX1278_available(&SX1278); //[cite: 1]
-          if (len > 0) { //[cite: 1]
-              SX1278_read(&SX1278, (uint8_t*)lora_packet, len); //[cite: 1]
-              NodeData node = read_lora_packet(lora_packet); //[cite: 1]
+      // 2. Блок обробки вхідних радіопакетів
+      if (lora_rx_flag) {
+    	  debug_log("STM32 CORE", "LoRa RX START");
+          lora_rx_flag = 0;
+
+          uint8_t len = SX1278_available(&SX1278);
+          if (len > 0) {
+              SX1278_read(&SX1278, (uint8_t*)lora_packet, len);
+              NodeData node = read_lora_packet(lora_packet);
 
               if (node.id > 0 && node.id < MAX_NODES) {
                   node_cache[node.id] = node;
@@ -290,7 +292,7 @@ int main(void)
 
                   // --- РОЗРАХУНОК СЛОТУ ---
                   // Фіксуємо час ЗАРАЗ — до будь-яких затримок передачі
-                  uint32_t now        = HAL_GetTick();
+                  uint32_t now = lora_rx_timestamp;
                   uint32_t cycle_time = now % CYCLE_PERIOD_MS;
                   uint32_t target_offset = (uint32_t)node.id * SLOT_OFFSET_MS;
 
@@ -308,7 +310,7 @@ int main(void)
                   if (drift_ms < -(int32_t)(CYCLE_PERIOD_MS / 2)) drift_ms += CYCLE_PERIOD_MS;
 
                   if (drift_ms > -2000 && drift_ms < 2000) {
-					node_clock_offset[node.id] += drift_ms / 4;
+					node_clock_offset[node.id] += drift_ms / 2;
 
 					if (node_clock_offset[node.id] > 5000)  node_clock_offset[node.id] = 5000;
 					if (node_clock_offset[node.id] < -5000) node_clock_offset[node.id] = -5000;
@@ -327,11 +329,7 @@ int main(void)
                   snprintf(drift_log, sizeof(drift_log),
                            "Node %d drift: %ld ms  sleep: %lu ms", node.id, drift_ms, sleep_ms);
                   debug_log("STM32_CORE", drift_log);
-                  char fine_log[48];
-                  uint32_t fine_ms_real = (uint32_t)node.flags * 10;
-                  snprintf(fine_log, sizeof(fine_log),
-                           "Node %d fine: %lu ms", node.id, fine_ms_real);
-                  debug_log("STM32_CORE", fine_log);
+
 
                   // --- ACK ---
                   uint8_t ack_packet[6];
@@ -350,31 +348,23 @@ int main(void)
               }
           }
 
-          SX1278_LoRaEntryRx(&SX1278, 16, 3000); //[cite: 1]
+          lora_rx_flag = 0;
+
+          SX1278_LoRaEntryRx(&SX1278, 16, 3000);
           debug_log("STM32 CORE", "LoRa RX END");
       }
 
       // 3. Інтерфейс
-      if (intro_complete == 0) { //[cite: 1]
-          ST7735_FillScreen(ST7735_BLACK); //[cite: 1]
-          draw_interface(); //[cite: 1]
-          intro_complete = 1; //[cite: 1]
-      }
+
 
       // Перемикання кнопкою (працюватиме, бо node_valid не скидається)
-      if (node_switch_flag) { //[cite: 1]
-          node_switch_flag = 0; //[cite: 1]
-          if (node_valid[selected_node]) { //[cite: 1]
-              draw_measurements(&node_cache[selected_node]); //[cite: 1]
-          }
-      }
+	if (intro_complete && node_switch_flag) {
+		node_switch_flag = 0;
+		if (node_valid[selected_node]) {
+			draw_measurements(&node_cache[selected_node]);
+		}
+	}
 
-      // Авто-оновлення для HUB
-      if (node_valid[selected_node] && node_cache[selected_node].id == 0) { //[cite: 1]
-          if (HAL_GetTick() - last_log_time < 100) { //[cite: 1]
-              draw_measurements(&node_cache[selected_node]); //[cite: 1]
-          }
-      }
 
     /* USER CODE END WHILE */
 
@@ -634,6 +624,22 @@ static void MX_USART6_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream6_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -714,6 +720,7 @@ static void MX_GPIO_Init(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == DIO0_Pin) {
+    	lora_rx_timestamp = HAL_GetTick();
         lora_rx_flag = 1;
 
     }
@@ -805,6 +812,7 @@ void draw_measurements(const NodeData *d){
 	char nodeName[12];
 
 	if(d->id != prevId){
+
 		prevId = d->id;
 
 		if(d->id == 0){
