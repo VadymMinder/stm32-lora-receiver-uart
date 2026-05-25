@@ -85,6 +85,7 @@ uint8_t node_valid[MAX_NODES] = {0};
 uint8_t node_unsaved[MAX_NODES] = {0};
 volatile uint8_t selected_node = 0;
 volatile uint8_t node_switch_flag = 0;
+int32_t node_clock_offset[MAX_NODES] = {0};
 
 
 uint32_t last_log_time = 0;
@@ -270,6 +271,7 @@ int main(void)
 
       // 2. Блок обробки вхідних радіопакетів
       if (lora_rx_flag) { //[cite: 1]
+    	  debug_log("STM32 CORE", "LoRa RX START");
           lora_rx_flag = 0; //[cite: 1]
 
           uint8_t len = SX1278_available(&SX1278); //[cite: 1]
@@ -305,6 +307,22 @@ int main(void)
                   if (drift_ms >  (int32_t)(CYCLE_PERIOD_MS / 2)) drift_ms -= CYCLE_PERIOD_MS;
                   if (drift_ms < -(int32_t)(CYCLE_PERIOD_MS / 2)) drift_ms += CYCLE_PERIOD_MS;
 
+                  if (drift_ms > -2000 && drift_ms < 2000) {
+					node_clock_offset[node.id] += drift_ms / 4;
+
+					if (node_clock_offset[node.id] > 5000)  node_clock_offset[node.id] = 5000;
+					if (node_clock_offset[node.id] < -5000) node_clock_offset[node.id] = -5000;
+				} else {
+					node_clock_offset[node.id] = 0;
+				}
+
+				// Пряме коригування з перевіркою на underflow (щоб не піти в мінус)
+				if ((int32_t)sleep_ms - node_clock_offset[node.id] < 100) {
+					sleep_ms = 100;
+				} else {
+					sleep_ms -= node_clock_offset[node.id];
+				}
+
                   char drift_log[48];
                   snprintf(drift_log, sizeof(drift_log),
                            "Node %d drift: %ld ms  sleep: %lu ms", node.id, drift_ms, sleep_ms);
@@ -333,6 +351,7 @@ int main(void)
           }
 
           SX1278_LoRaEntryRx(&SX1278, 16, 3000); //[cite: 1]
+          debug_log("STM32 CORE", "LoRa RX END");
       }
 
       // 3. Інтерфейс
