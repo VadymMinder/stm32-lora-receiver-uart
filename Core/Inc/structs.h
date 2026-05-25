@@ -14,6 +14,7 @@ typedef struct {
     float temp;
     float humidity;
     float pressure;
+    uint8_t flags;
 } NodeData;
 
 NodeData parse_node_data(const char* str);
